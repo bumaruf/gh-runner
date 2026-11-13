@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path"
+	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -52,7 +53,11 @@ const (
 	labelRunnerID = "ghpool.runner-id"
 	labelSlot     = "ghpool.slot"
 
-	orphanGrace     = 2 * time.Minute
+	orphanGrace = 2 * time.Minute
+	orphanSweep = 5 * time.Minute
+	// A tick finishes even after a stop signal: cut short, a runner can end up registered on
+	// GitHub with no container behind it.
+	tickTimeout     = 2 * time.Minute
 	cacheMaxIdle    = 10 * time.Minute
 	summaryInterval = 5 * time.Minute
 	// GitHub's secondary limit allows 900 REST points a minute; this leaves room for the rest.
@@ -80,6 +85,8 @@ type Pool struct {
 
 	repos       []string
 	reposAt     time.Time
+	ownName     *regexp.Regexp
+	sweptAt     time.Time
 	failures    map[string]failure
 	lastSummary time.Time
 	lastState   string
@@ -108,6 +115,7 @@ func New(cfg Config, gh *github.Client, dockerClient *docker.Client, log *slog.L
 		log:            log,
 		registerLabels: labels,
 		accepts:        accepts,
+		ownName:        regexp.MustCompile("^" + regexp.QuoteMeta(cfg.Name) + `-\d+-[0-9a-f]{6}$`),
 		failures:       map[string]failure{},
 	}
 }
@@ -129,9 +137,11 @@ func (p *Pool) Run(ctx context.Context) error {
 
 	for {
 		started := time.Now()
-		if err := p.tick(ctx); err != nil && ctx.Err() == nil {
+		tickCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tickTimeout)
+		if err := p.tick(tickCtx); err != nil {
 			p.log.Error("tick failed", "err", err)
 		}
+		cancel()
 		select {
 		case <-ctx.Done():
 			p.log.Info("pool stopped; runner containers keep running and are adopted on the next start")
@@ -153,6 +163,7 @@ func (p *Pool) tick(ctx context.Context) error {
 		return fmt.Errorf("list runner containers: %w", err)
 	}
 	runners := p.observe(ctx, containers)
+	p.sweepOrphans(ctx, now, containers)
 
 	decided := plan(planInput{
 		Slots:       p.cfg.Slots,
@@ -326,6 +337,37 @@ func (p *Pool) observe(ctx context.Context, containers []docker.Container) []Run
 		runners = append(runners, r)
 	}
 	return runners
+}
+
+// sweepOrphans deregisters runners of this pool that GitHub still lists, offline, with no
+// container behind them: what a crash between registering a runner and starting its
+// container leaves. GitHub would only drop them after a day.
+func (p *Pool) sweepOrphans(ctx context.Context, now time.Time, containers []docker.Container) {
+	if now.Sub(p.sweptAt) < orphanSweep {
+		return
+	}
+	p.sweptAt = now
+	backed := map[string]bool{}
+	for _, c := range containers {
+		backed[c.Labels[labelRepo]+"#"+c.Labels[labelRunnerID]] = true
+	}
+	for _, repo := range p.repos {
+		runners, err := p.gh.Runners(ctx, repo)
+		if err != nil {
+			continue
+		}
+		for _, r := range runners {
+			if !p.ownName.MatchString(r.Name) || r.Busy || r.Status != "offline" ||
+				backed[repo+"#"+strconv.FormatInt(r.ID, 10)] {
+				continue
+			}
+			if err := p.gh.DeleteRunner(ctx, repo, r.ID); err != nil {
+				p.log.Warn("could not deregister orphan runner", "repo", repo, "runner", r.Name, "err", err)
+				continue
+			}
+			p.log.Info("orphan runner deregistered", "repo", repo, "runner", r.Name)
+		}
+	}
 }
 
 func (p *Pool) remove(ctx context.Context, removal Removal, now time.Time) {

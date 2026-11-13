@@ -1,25 +1,27 @@
 # gh-runner
 
-Runners próprios do GitHub Actions para qualquer repo, rodando em containers Docker numa VM (pensado para a Ampere Always Free da Oracle Cloud). A ideia é usar os runners hospedados do GitHub por padrão e trocar para estes quando os minutos gratuitos do mês acabam.
+Um pool de runners próprios do GitHub Actions, compartilhado entre todos os repos privados da sua conta, sem precisar de organização.
 
-- `gh-runner`: roda na sua máquina, comanda o host por SSH e pede os tokens ao GitHub.
-- `oracle-launch.sh`: roda na sua máquina, cria a VM na Oracle tentando de novo até haver capacidade.
-- `host/`: o que vai para o host, em `/opt/gh-runner`.
-  - `Dockerfile`: a imagem oficial `ghcr.io/actions/actions-runner` (amd64 e arm64), numa versão fixa, com o script de entrada.
-  - `entrypoint.sh`: dentro do container, sobe o runner registrado, ou registra e remove o registro.
-  - `runnerctl`: no host, cria e remove um container por runner.
-  - `host-setup.sh`: prepara um Ubuntu novo (Docker, swap, rotação de logs, limpeza semanal).
+Numa conta pessoal, o GitHub só deixa um runner se registrar num único repo. O `ghpool` contorna isso com runners _just-in-time_: ele acompanha os repos, e quando aparece um job na fila pedindo as labels do pool, registra um runner efêmero naquele repo, sobe um container que roda só esse job e o descarta em seguida. As vagas do pool (6 por padrão) atendem qualquer repo, por ordem de chegada dos jobs.
+
+```
+job na fila (qualquer repo) ──► ghpool ──► runner JIT no repo ──► container roda 1 job ──► sai
+                                  ▲                                                       │
+                                  └────────────────── vaga livre de novo ◄────────────────┘
+```
 
 ## Como funciona
 
-- **Um runner por repo.** Numa conta pessoal do GitHub, um runner só se registra num repo. Por isso cada runner é um container `ghr-<owner>--<repo>-<n>`, e um mesmo host atende vários repos com um ou mais runners cada.
-- **Tokens.** O `gh-runner` gera o token de registro (ou de remoção) com `gh api` na sua máquina e o passa pelo SSH direto para o stdin do container. O token vale 1 hora e só serve para isso. Nenhum token fica no host, na imagem ou no repo.
-- **Volumes.** Cada runner guarda a configuração (`.runner`, `.credentials`, `.credentials_rsaparams`) num volume, e o registro sobrevive a reinícios. Também tem, por runner, caches de `~/.cache` (Playwright e outros), do store do pnpm, do npm e do tool cache do `setup-*`.
-- **Rede.** Cada container tem a própria rede do Docker. Jobs que usam porta fixa não se cruzam.
-- **Isolamento.** Os containers não montam o socket do Docker nem pastas do host. Jobs que dependem de `services:` ou de `docker build` não rodam nesses runners.
-- **Labels.** `self-hosted`, `Linux`, a arquitetura (`ARM64` na Ampere) e `oracle`. Para mudar a label extra, defina `GH_RUNNER_LABELS` em `/etc/gh-runner.env` no host e rode `gh-runner upgrade`.
-
-Os comandos abaixo rodam da raiz deste repo, com o `gh` autenticado numa conta com admin nos repos atendidos.
+- **Descoberta dos repos.** O pool atende todos os repos privados e não arquivados que a credencial alcança, e relê a lista a cada 5 minutos. Repo novo entra sozinho. `REPOS_INCLUDE` e `REPOS_EXCLUDE` filtram por padrão (`bumaruf/*`, `bumaruf/site`).
+- **Repos públicos ficam de fora.** Num repo público, um pull request de fork rodaria código nesta máquina. Só entram com `ALLOW_PUBLIC_REPOS=true`.
+- **Consulta barata.** A cada 5 segundos, o pool lê os runs ativos de cada repo e os jobs deles com requisições condicionais (ETag). Quando nada mudou, o GitHub responde `304` e não desconta do limite de chamadas. Parado, o pool gasta perto de zero da cota; com atividade, só as respostas que mudaram contam. O intervalo se alarga sozinho com muitos repos, e o pool pausa se o GitHub pedir (limite primário ou secundário).
+- **Um job, um container.** Cada job roda num container novo da imagem `runner/`, que termina com o job. Nada de um job sobra para o próximo, e o GitHub remove o registro do runner ao final.
+- **Vagas e caches.** Cada vaga tem volumes próprios para `~/.cache` (Playwright e outros), o store do pnpm, o cache do npm e o tool cache do `setup-*`. Uma vaga roda um job por vez, então dois jobs nunca escrevem no mesmo cache ao mesmo tempo. Jobs de repos diferentes compartilham os caches de uma vaga ao longo do tempo.
+- **Rede.** Cada vaga tem a própria rede do Docker; jobs em paralelo não se enxergam.
+- **Sem estado.** A cada ciclo, o pool remonta o quadro a partir do Docker e do GitHub. Se o serviço reinicia, os jobs em andamento continuam, e os containers são adotados na volta.
+- **Limpeza.** Container que termina sai do pool. Runner que subiu e ficou sem job (o run foi cancelado, por exemplo) é removido depois de `IDLE_TIMEOUT`, desde que o repo não tenha job na fila. A cada 5 minutos, o pool desregistra runners com o nome dele que ficaram offline sem container, como os que uma queda de energia deixaria.
+- **Falhas.** Se o registro ou o container de um repo falha, o repo espera antes de tentar de novo, de 10 segundos até 5 minutos, e os outros repos seguem normalmente.
+- **Labels.** Os runners têm `self-hosted`, `linux`, a arquitetura (`x64` ou `arm64`) e as de `POOL_LABELS` (`gh-runner` por padrão). O pool só pega jobs cujo `runs-on` caiba nessas labels.
 
 ## Usar num repo
 
@@ -29,19 +31,104 @@ Nos jobs do workflow:
 runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '"ubuntu-latest"') }}
 ```
 
-Sem a variável `CI_RUNS_ON`, o job roda no `ubuntu-latest` do GitHub. Quando os minutos acabarem:
+Sem a variável `CI_RUNS_ON`, o job roda no `ubuntu-latest` do GitHub. Para mandar o repo para o pool:
 
 ```bash
-./gh-runner use <owner/repo> self
+gh variable set CI_RUNS_ON --repo <owner/repo> --body '["self-hosted","gh-runner"]'
 ```
 
-Isso grava `CI_RUNS_ON=["self-hosted","oracle"]` no repo. Na virada do mês, volte:
+Para voltar aos runners do GitHub:
 
 ```bash
-./gh-runner use <owner/repo> hosted
+gh variable delete CI_RUNS_ON --repo <owner/repo>
 ```
 
-O repo precisa ter runners registrados (abaixo) antes de usar `self`.
+Também dá para fixar `runs-on: [self-hosted, gh-runner]` direto no workflow.
+
+O workflow `selftest` deste repo dispara 3 jobs ao mesmo tempo no pool e confere runner, caches, `setup-node` e `sudo`:
+
+```bash
+gh workflow run selftest.yml --repo bumaruf/gh-runner
+```
+
+## Credencial
+
+O pool precisa registrar runners nos repos e ler os runs.
+
+**GitHub App (recomendado).** Os tokens duram uma hora e alcançam só os repos onde a app está instalada.
+
+1. Em _Settings → Developer settings → GitHub Apps → New GitHub App_: qualquer nome e homepage, _Webhook_ desmarcado, e as permissões de repositório:
+   - _Administration_: Read and write;
+   - _Actions_: Read-only;
+   - _Metadata_: Read-only (já vem marcada).
+2. Em _Where can this GitHub App be installed?_, _Only on this account_.
+3. Gere uma _private key_ e salve como `secrets/github-app.pem`.
+4. Instale a app na sua conta, em todos os repos ou nos escolhidos. Repos adicionados à instalação depois entram sozinhos no pool.
+5. No `.env`, `GITHUB_APP_ID` com o _App ID_ ou o _Client ID_ da app.
+
+**Token.** Em vez da app, um fine-grained token com _Administration_ (write) e _Actions_ (read) nos repos, em `GITHUB_TOKEN`. Ele não expira sozinho na mesma frequência e costuma alcançar mais do que precisa, por isso a app é melhor.
+
+## Subir o pool
+
+Num host com Docker e o plugin compose (no Ubuntu da Oracle, rode antes `sudo ./host-setup.sh`):
+
+```bash
+cp .env.example .env    # e preencha
+docker compose up -d --build
+docker compose logs -f ghpool
+```
+
+O `compose` constrói a imagem dos runners (`ghpool-runner`) e a do serviço, e deixa o `ghpool` rodando com `restart: unless-stopped`. O serviço recebe o socket do Docker para criar os containers dos runners; os runners nunca recebem esse socket.
+
+Para parar:
+
+```bash
+docker compose down
+```
+
+O serviço termina o ciclo em andamento antes de sair. Os jobs que estão rodando continuam e são adotados quando ele voltar.
+
+Rode uma única instância por `POOL_NAME`. Hosts diferentes (o PC e a VM da Oracle, por exemplo) usam nomes diferentes e podem atender os mesmos repos ao mesmo tempo.
+
+## Configuração
+
+| Variável | Padrão | O que faz |
+|---|---|---|
+| `GITHUB_APP_ID` | | App ID ou Client ID da GitHub App. |
+| `GITHUB_APP_PRIVATE_KEY_FILE` | | Chave privada da app (no compose, `/run/secrets/github-app.pem`). |
+| `GITHUB_APP_INSTALLATION_ID` | | Só se a app tiver mais de uma instalação. |
+| `GITHUB_TOKEN` | | Alternativa à app. |
+| `POOL_NAME` | `ghpool` | Distingue pools no mesmo Docker e prefixa os nomes dos runners. |
+| `POOL_SIZE` | `6` | Vagas, ou seja, jobs ao mesmo tempo. |
+| `POOL_LABELS` | `gh-runner` | Labels extras dos runners, separadas por vírgula. |
+| `RUNNER_CPUS` | `0` | Limite de CPU por job (`4`, `2.5`); `0` é sem limite. |
+| `RUNNER_MEMORY` | `0` | Limite de memória por job (`8g`, `512m`); `0` é sem limite. |
+| `POLL_INTERVAL` | `5s` | Intervalo entre consultas. |
+| `IDLE_TIMEOUT` | `5m` | Quanto um runner sem job espera antes de sair. |
+| `REPO_REFRESH` | `5m` | Intervalo para reler a lista de repos. |
+| `REPOS_INCLUDE` | | Padrões de repos atendidos; vazio é todos. |
+| `REPOS_EXCLUDE` | | Padrões de repos ignorados. |
+| `ALLOW_PUBLIC_REPOS` | `false` | Atende também repos públicos. |
+| `RUNNER_VERSION` | `2.338.2` | Versão de `actions/runner` da imagem (no compose). |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn` ou `error`. |
+
+`nproc` dentro de um job mostra todos os núcleos do host, mesmo com `RUNNER_CPUS`. Ferramentas que paralelizam por `nproc` podem precisar de um limite próprio.
+
+## Limitações
+
+- Os containers dos runners não têm Docker. Jobs com `services:`, `container:` ou `docker build` não rodam no pool; mantenha esses no `ubuntu-latest`.
+- Entre o job entrar na fila e começar, passam alguns segundos: até um ciclo de consulta mais a subida do container (cerca de 15 segundos no total).
+- Os jobs de repos diferentes compartilham os caches de uma vaga. Um job pode, em tese, envenenar um cache usado depois por outro repo. Como o pool só atende os seus repos privados, a troca vale pela velocidade.
+
+## Atualizar a versão do runner
+
+Troque `RUNNER_VERSION` (no `.env` ou no padrão do `compose.yaml` e do `runner/Dockerfile`) por uma versão de [actions/runner](https://github.com/actions/runner/releases) com pelo menos duas semanas, e:
+
+```bash
+docker compose up -d --build
+```
+
+Os próximos jobs já usam a imagem nova. O runner também se atualiza sozinho quando o GitHub exige uma versão mais nova.
 
 ## Criar a VM na Oracle
 
@@ -65,71 +152,15 @@ O script para quando a VM fica `RUNNING`, mostra o IP público e avisa com `noti
 setsid nohup env OCI_CLI_PROFILE=DEFAULT OCI_SUBNET_ID=... OCI_IMAGE_ID=... ./oracle-launch.sh > launch.log 2>&1 < /dev/null &
 ```
 
-**Recuperação de instância ociosa.** Numa conta só Always Free, a Oracle pode desligar uma instância que passa 7 dias com CPU, rede e memória abaixo de 20%. Um runner parado fica assim. Para evitar, converta a conta para Pay As You Go: o uso dentro do Always Free continua sem custo e a regra deixa de valer.
+Com a VM de pé, clone este repo nela, rode `sudo ./host-setup.sh`, entre de novo por SSH e suba o pool com um `POOL_NAME` próprio.
 
-## Acessar o host
+**Recuperação de instância ociosa.** Numa conta só Always Free, a Oracle pode desligar uma instância que passa 7 dias com CPU, rede e memória abaixo de 20%. Um pool parado fica assim. Para evitar, converta a conta para Pay As You Go: o uso dentro do Always Free continua sem custo e a regra deixa de valer.
 
-Por SSH, pelo alias `gh-runner` do `~/.ssh/config` (ou outro destino em `GH_RUNNER_HOST`):
-
-```
-Host gh-runner
-  HostName <ip público da VM>
-  User ubuntu
-  IdentityFile ~/.ssh/gh-runner-oracle_ed25519
-```
-
-A VM só precisa de saída para a internet. Nenhuma porta além do SSH fica aberta.
-
-## Preparar o host
+## Desenvolvimento
 
 ```bash
-./gh-runner setup
+go test -race ./...
+go vet ./...
 ```
 
-Copia `host/` para `/opt/gh-runner`, instala o Docker, cria 4 GB de swap e constrói a imagem.
-
-## Adicionar runners a um repo
-
-```bash
-./gh-runner add <owner/repo> 2
-./gh-runner add <owner/outro-repo>
-```
-
-Cada `add` cria runners novos, numerados depois dos que o repo já tem. Com 2 OCPU e 12 GB, dois runners rodando ao mesmo tempo é um bom limite para o host todo.
-
-## Ver o estado
-
-```bash
-./gh-runner list
-./gh-runner logs <owner/repo> 1
-```
-
-O `list` mostra os containers no host e, para cada repo, os runners como o GitHub os vê (`online`, `offline`, `busy`).
-
-## Remover
-
-```bash
-./gh-runner remove <owner/repo> 2   # só o runner 2
-./gh-runner remove <owner/repo>     # todos do repo
-```
-
-Tira o registro no GitHub e apaga o container, a rede e os volumes.
-
-## Atualizar a versão do runner
-
-A versão fica fixa no `FROM` de `host/Dockerfile`. Troque a tag por uma versão de [actions/runner](https://github.com/actions/runner/releases) com pelo menos duas semanas e rode:
-
-```bash
-./gh-runner upgrade
-```
-
-O runner também se atualiza sozinho quando o GitHub publica uma versão nova. Essa atualização some quando o container é recriado, e aí ele se atualiza de novo.
-
-## Registrar de novo
-
-O GitHub remove um runner que passa 14 dias offline. Se isso acontecer, remova e adicione de novo:
-
-```bash
-./gh-runner remove <owner/repo> 1
-./gh-runner add <owner/repo>
-```
+`internal/pool/plan.go` concentra as regras de decisão (o que remover, onde subir runners) numa função pura, coberta por `plan_test.go`. O resto é I/O: `internal/github` (REST com ETag, token de app) e `internal/docker` (Engine API pelo socket), só com a biblioteca padrão.
