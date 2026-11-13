@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# Runs on the runner host. Manages one Docker container per (repo, index), each a
+# self-hosted runner registered to a single repo. Registration tokens arrive on stdin and are
+# never written to disk. Driven from a workstation by the gh-runner script (README.md).
+#
+#   runnerctl build                     # builds the image from this directory
+#   runnerctl register <owner/repo> <n> # token on stdin; registers and starts runner n
+#   runnerctl remove <owner/repo> <n>   # token on stdin; unregisters and deletes runner n
+#   runnerctl start|stop <owner/repo> <n>
+#   runnerctl indexes <owner/repo>      # indexes of the runners of a repo, one per line
+#   runnerctl list                      # every runner container and its state
+#   runnerctl upgrade                   # rebuilds the image and recreates every runner
+#   runnerctl logs <owner/repo> <n>
+set -euo pipefail
+
+cd "$(dirname "$(readlink -f "$0")")"
+
+image_tag="$(sed -n 's|^FROM ghcr.io/actions/actions-runner:\(.*\)$|\1|p' Dockerfile)"
+image="gh-runner:${image_tag}"
+# Labels every runner gets on top of the automatic self-hosted, Linux and X64/ARM64.
+# GH_RUNNER_LABELS in /etc/gh-runner.env replaces them.
+[[ -f /etc/gh-runner.env ]] && source /etc/gh-runner.env
+labels="${GH_RUNNER_LABELS:-oracle}"
+host_name="${GH_RUNNER_HOST_NAME:-$(hostname -s)}"
+
+die() {
+  echo "$*" >&2
+  exit 1
+}
+
+slug() {
+  [[ "$1" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "Expected <owner/repo>, got '$1'."
+  echo "${1/\//--}" | tr '[:upper:]' '[:lower:]'
+}
+
+index_arg() {
+  [[ "${1:-}" =~ ^[0-9]+$ ]] || die "Expected a runner index, got '${1:-}'."
+  echo "$1"
+}
+
+container_name() { echo "ghr-$(slug "$1")-$2"; }
+
+runner_name() { echo "${host_name}-$(slug "$1")-$2"; }
+
+# Every runner has its own network, so jobs that bind fixed ports (an e2e server, say) never
+# meet each other.
+ensure_network() {
+  docker network inspect "$1" >/dev/null 2>&1 || docker network create "$1" >/dev/null
+}
+
+runner_args() {
+  local repo="$1" index="$2" name
+  name="$(container_name "$repo" "$index")"
+  printf '%s\n' \
+    --name "$name" \
+    --hostname "$name" \
+    --init \
+    --network "$name" \
+    --label "gh-runner.repo=$repo" \
+    --label "gh-runner.index=$index" \
+    --env "RUNNER_NAME=$(runner_name "$repo" "$index")" \
+    --env "RUNNER_URL=https://github.com/$repo" \
+    --env "RUNNER_LABELS=$labels" \
+    --volume "$name-config:/runner-config" \
+    --volume "$name-cache:/home/runner/.cache" \
+    --volume "$name-pnpm:/home/runner/.local/share/pnpm" \
+    --volume "$name-npm:/home/runner/.npm" \
+    --volume "$name-toolcache:/opt/hostedtoolcache"
+}
+
+start_runner() {
+  local repo="$1" index="$2" name args
+  name="$(container_name "$repo" "$index")"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  ensure_network "$name"
+  mapfile -t args < <(runner_args "$repo" "$index")
+  # Lets a running job finish its step before the runner goes down.
+  docker run -d --restart unless-stopped --stop-timeout 60 "${args[@]}" "$image" run >/dev/null
+  echo "Started $name."
+}
+
+stop_runner() {
+  docker stop "$(container_name "$1" "$2")" >/dev/null
+  echo "Stopped $(container_name "$1" "$2")."
+}
+
+one_shot() {
+  local action="$1" repo="$2" index="$3" name args
+  name="$(container_name "$repo" "$index")"
+  # The listener holds the session; it has to be down while the registration changes.
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  ensure_network "$name"
+  mapfile -t args < <(runner_args "$repo" "$index")
+  docker run --rm -i "${args[@]}" "$image" "$action"
+}
+
+delete_runner_data() {
+  local name
+  name="$(container_name "$1" "$2")"
+  docker volume rm "$name-config" "$name-cache" "$name-pnpm" "$name-npm" "$name-toolcache" \
+    >/dev/null 2>&1 || true
+  docker network rm "$name" >/dev/null 2>&1 || true
+}
+
+all_runners() {
+  docker ps -a --filter label=gh-runner.repo \
+    --format '{{.Label "gh-runner.repo"}} {{.Label "gh-runner.index"}}'
+}
+
+case "${1:-}" in
+  build)
+    docker build -t "$image" .
+    ;;
+  register)
+    repo="$2"
+    index="$(index_arg "${3:-}")"
+    one_shot register "$repo" "$index"
+    start_runner "$repo" "$index"
+    ;;
+  remove)
+    repo="$2"
+    index="$(index_arg "${3:-}")"
+    one_shot remove "$repo" "$index" || echo "GitHub refused the removal; deleting locally anyway." >&2
+    delete_runner_data "$repo" "$index"
+    echo "Removed $(container_name "$repo" "$index")."
+    ;;
+  start)
+    start_runner "$2" "$(index_arg "${3:-}")"
+    ;;
+  stop)
+    stop_runner "$2" "$(index_arg "${3:-}")"
+    ;;
+  indexes)
+    slug "$2" >/dev/null
+    all_runners | awk -v repo="$2" '$1 == repo { print $2 }' | sort -n
+    ;;
+  list)
+    docker ps -a --filter label=gh-runner.repo \
+      --format 'table {{.Label "gh-runner.repo"}}\t{{.Label "gh-runner.index"}}\t{{.Names}}\t{{.Status}}'
+    ;;
+  upgrade)
+    docker build -t "$image" .
+    while read -r repo index; do
+      start_runner "$repo" "$index"
+    done < <(all_runners)
+    docker image prune -f >/dev/null
+    ;;
+  logs)
+    docker logs -f "$(container_name "$2" "$(index_arg "${3:-}")")"
+    ;;
+  *)
+    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+    exit 2
+    ;;
+esac
