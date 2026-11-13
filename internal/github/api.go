@@ -55,26 +55,24 @@ func (c *Client) UserRepos(ctx context.Context) ([]Repo, error) {
 }
 
 type Run struct {
-	ID     int64  `json:"id"`
-	Status string `json:"status"`
+	ID        int64     `json:"id"`
+	Status    string    `json:"status"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
-// ActiveRuns returns the repo's recent workflow runs that have not completed. One request
-// covers both queued runs and in-progress runs whose later jobs still wait for a runner.
-func (c *Client) ActiveRuns(ctx context.Context, repo string) ([]Run, error) {
+func (r Run) Active() bool { return r.Status != "completed" }
+
+// RecentRuns returns the repo's 50 latest workflow runs, newest first. One request covers
+// queued runs, in-progress runs whose later jobs still wait for a runner, and when the repo
+// last ran anything.
+func (c *Client) RecentRuns(ctx context.Context, repo string) ([]Run, error) {
 	var resp struct {
 		WorkflowRuns []Run `json:"workflow_runs"`
 	}
 	if err := c.get(ctx, "/repos/"+repo+"/actions/runs?per_page=50", true, &resp); err != nil {
 		return nil, err
 	}
-	var active []Run
-	for _, run := range resp.WorkflowRuns {
-		if run.Status != "completed" {
-			active = append(active, run)
-		}
-	}
-	return active, nil
+	return resp.WorkflowRuns, nil
 }
 
 type Job struct {

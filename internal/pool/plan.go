@@ -19,6 +19,10 @@ type Runner struct {
 	RunnerID    int64
 	Slot        int
 	ContainerID string
+	// SidecarID is the job's own Docker, when the pool gives jobs one.
+	SidecarID string
+	// WorkVolume holds the job's work folder, shared with its Docker.
+	WorkVolume  string
 	StartedAt   time.Time
 	Running     bool
 	ExitedClean bool

@@ -32,12 +32,12 @@ func TestARepeatedPollIsRevalidatedAndServedFromTheCachedBody(t *testing.T) {
 	client := NewClient(server.URL, StaticToken("t"))
 
 	for range 3 {
-		runs, err := client.ActiveRuns(context.Background(), "me/web")
+		runs, err := client.RecentRuns(context.Background(), "me/web")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(runs) != 1 || runs[0].ID != 7 {
-			t.Fatalf("runs = %+v, want only the queued run 7", runs)
+		if len(runs) != 2 || runs[0].ID != 7 || !runs[0].Active() || runs[1].Active() {
+			t.Fatalf("runs = %+v, want run 7 queued and run 8 completed", runs)
 		}
 	}
 	if got := full.Load(); got != 1 {
@@ -54,10 +54,10 @@ func TestASecondaryRateLimitPausesTheClient(t *testing.T) {
 	defer server.Close()
 	client := NewClient(server.URL, StaticToken("t"))
 
-	if _, err := client.ActiveRuns(context.Background(), "me/web"); err == nil {
+	if _, err := client.RecentRuns(context.Background(), "me/web"); err == nil {
 		t.Fatal("want the 403 as an error")
 	}
-	if _, err := client.ActiveRuns(context.Background(), "me/web"); err != ErrPaused {
+	if _, err := client.RecentRuns(context.Background(), "me/web"); err != ErrPaused {
 		t.Fatalf("err = %v, want ErrPaused without another request", err)
 	}
 	if paused := client.PausedFor(); paused < 25*time.Second {

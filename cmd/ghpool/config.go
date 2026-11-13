@@ -87,6 +87,11 @@ func loadConfig(getenv func(string) string, readFile func(string) ([]byte, error
 	if !poolNamePattern.MatchString(name) {
 		errs = append(errs, errors.New("POOL_NAME: want lowercase letters, digits and dashes, up to 31"))
 	}
+	cacheTTL := duration("CACHE_TTL", "336h")
+	dockerInJobs, err := strconv.ParseBool(env("RUNNER_DOCKER", "false"))
+	if err != nil {
+		errs = append(errs, errors.New("RUNNER_DOCKER: want true or false"))
+	}
 	cpus, err := strconv.ParseFloat(env("RUNNER_CPUS", "0"), 64)
 	if err != nil || cpus < 0 {
 		errs = append(errs, errors.New("RUNNER_CPUS: want a number such as 4 or 2.5; 0 means no limit"))
@@ -101,8 +106,11 @@ func loadConfig(getenv func(string) string, readFile func(string) ([]byte, error
 		Slots:        slots,
 		Labels:       list(env("POOL_LABELS", "gh-runner")),
 		Image:        env("RUNNER_IMAGE", "ghpool-runner:2.338.2"),
-		NanoCPUs:     int64(cpus * 1e9),
+		CPUs:         cpus,
 		Memory:       memory,
+		Docker:       dockerInJobs,
+		DindImage:    env("DIND_IMAGE", "docker:29.9.2-dind"),
+		CacheTTL:     cacheTTL,
 		PollInterval: duration("POLL_INTERVAL", "5s"),
 		IdleTimeout:  duration("IDLE_TIMEOUT", "5m"),
 		RepoRefresh:  duration("REPO_REFRESH", "5m"),

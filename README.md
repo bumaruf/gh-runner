@@ -16,10 +16,12 @@ job na fila (qualquer repo) ──► ghpool ──► runner JIT no repo ──
 - **Repos públicos ficam de fora.** Num repo público, um pull request de fork rodaria código nesta máquina. Só entram com `ALLOW_PUBLIC_REPOS=true`.
 - **Consulta barata.** A cada 5 segundos, o pool lê os runs ativos de cada repo e os jobs deles com requisições condicionais (ETag). Quando nada mudou, o GitHub responde `304` e não desconta do limite de chamadas. Parado, o pool gasta perto de zero da cota; com atividade, só as respostas que mudaram contam. O intervalo se alarga sozinho com muitos repos, e o pool pausa se o GitHub pedir (limite primário ou secundário).
 - **Um job, um container.** Cada job roda num container novo da imagem `runner/`, que termina com o job. Nada de um job sobra para o próximo, e o GitHub remove o registro do runner ao final.
-- **Vagas e caches.** Cada vaga tem volumes próprios para `~/.cache` (Playwright e outros), o store do pnpm, o cache do npm e o tool cache do `setup-*`. Uma vaga roda um job por vez, então dois jobs nunca escrevem no mesmo cache ao mesmo tempo. Jobs de repos diferentes compartilham os caches de uma vaga ao longo do tempo.
+- **Caches por repo e vaga.** Cada repo tem, em cada vaga, volumes próprios para `~/.cache` (Playwright e outros), o store do pnpm, o cache do npm, o tool cache do `setup-*` e, com Docker nos jobs, as imagens baixadas. Um repo nunca lê o que outro escreveu, e uma vaga roda um job por vez, então dois jobs nunca escrevem no mesmo cache ao mesmo tempo. O primeiro job de um repo em cada vaga começa com os caches vazios.
+- **Docker nos jobs.** Com `RUNNER_DOCKER=true`, cada job ganha um Docker próprio, num container ao lado do runner que nasce e morre com o job. `services:`, `container:`, `docker build` e `docker run` funcionam como nos runners do GitHub: os serviços ficam em `localhost`, e o Docker do job enxerga a pasta de trabalho no mesmo caminho do runner. Esse container roda em modo `privileged`, o que dá ao código do job acesso de root ao host; por isso o pool atende só repos privados, os seus.
 - **Rede.** Cada vaga tem a própria rede do Docker; jobs em paralelo não se enxergam.
+- **CPUs.** Com `RUNNER_CPUS` inteiro e vagas que caibam nos núcleos do host (6 vagas de 4 num host de 24, por exemplo), cada vaga fica presa aos próprios núcleos, e `nproc` no job mostra só os dela. Se não couberem, vale um limite de cota, e `nproc` mostra todos os núcleos do host.
 - **Sem estado.** A cada ciclo, o pool remonta o quadro a partir do Docker e do GitHub. Se o serviço reinicia, os jobs em andamento continuam, e os containers são adotados na volta.
-- **Limpeza.** Container que termina sai do pool. Runner que subiu e ficou sem job (o run foi cancelado, por exemplo) é removido depois de `IDLE_TIMEOUT`, desde que o repo não tenha job na fila. A cada 5 minutos, o pool desregistra runners com o nome dele que ficaram offline sem container, como os que uma queda de energia deixaria.
+- **Limpeza.** Container que termina sai do pool, com a pasta de trabalho do job. Runner que subiu e ficou sem job (o run foi cancelado, por exemplo) é removido depois de `IDLE_TIMEOUT`, desde que o repo não tenha job na fila. A cada 5 minutos, o pool desregistra runners com o nome dele que ficaram offline sem container, como os que uma queda de energia deixaria. A cada hora, apaga os caches de repos que saíram do pool ou não rodam nada há `CACHE_TTL`.
 - **Falhas.** Se o registro ou o container de um repo falha, o repo espera antes de tentar de novo, de 10 segundos até 5 minutos, e os outros repos seguem normalmente.
 - **Labels.** Os runners têm `self-hosted`, `linux`, a arquitetura (`x64` ou `arm64`) e as de `POOL_LABELS` (`gh-runner` por padrão). O pool só pega jobs cujo `runs-on` caiba nessas labels.
 
@@ -104,7 +106,10 @@ Rode uma única instância por `POOL_NAME`. Hosts diferentes (um PC e uma VM, po
 | `POOL_SIZE` | `6` | Vagas, ou seja, jobs ao mesmo tempo. |
 | `POOL_LABELS` | `gh-runner` | Labels extras dos runners, separadas por vírgula. |
 | `RUNNER_CPUS` | `0` | Limite de CPU por job (`4`, `2.5`); `0` é sem limite. |
-| `RUNNER_MEMORY` | `0` | Limite de memória por job (`8g`, `512m`); `0` é sem limite. |
+| `RUNNER_MEMORY` | `0` | Limite de memória por job (`8g`, `512m`); `0` é sem limite. Com Docker nos jobs, vale também para o Docker do job. |
+| `RUNNER_DOCKER` | `false` | Dá a cada job um Docker próprio (`services:`, `container:`, `docker build`). |
+| `DIND_IMAGE` | `docker:29.9.2-dind` | Imagem do Docker de cada job. |
+| `CACHE_TTL` | `336h` | Tempo sem runs depois do qual os caches de um repo são apagados. |
 | `POLL_INTERVAL` | `5s` | Intervalo entre consultas. |
 | `IDLE_TIMEOUT` | `5m` | Quanto um runner sem job espera antes de sair. |
 | `REPO_REFRESH` | `5m` | Intervalo para reler a lista de repos. |
@@ -114,13 +119,10 @@ Rode uma única instância por `POOL_NAME`. Hosts diferentes (um PC e uma VM, po
 | `RUNNER_VERSION` | `2.338.2` | Versão de `actions/runner` da imagem (no compose). |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` ou `error`. |
 
-`nproc` dentro de um job mostra todos os núcleos do host, mesmo com `RUNNER_CPUS`. Ferramentas que paralelizam por `nproc` podem precisar de um limite próprio.
-
 ## Limitações
 
-- Os containers dos runners não têm Docker. Jobs com `services:`, `container:` ou `docker build` não rodam no pool; mantenha esses no `ubuntu-latest`.
-- Entre o job entrar na fila e começar, passam alguns segundos: até um ciclo de consulta mais a subida do container (cerca de 15 segundos no total).
-- Os jobs de repos diferentes compartilham os caches de uma vaga. Um job pode, em tese, envenenar um cache usado depois por outro repo. Como o pool só atende os seus repos privados, a troca vale pela velocidade.
+- Entre o job entrar na fila e começar, passam cerca de 15 segundos: até um ciclo de consulta mais a subida do container e do runner. Nos runners do GitHub, a espera é parecida.
+- O Docker de cada job usa as faixas `10.249.0.0/24` e `10.250.0.0/16`, para não colidir com o `172.17.0.0/16` padrão do host. Se o host usar essas faixas, ajuste `dindBridge` e `dindPools` em `internal/pool/pool.go`.
 
 ## Atualizar a versão do runner
 

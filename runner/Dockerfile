@@ -31,9 +31,9 @@ RUN mkdir -p -m 755 /etc/apt/keyrings \
 # Mount points of the slot cache volumes are created here so Docker gives them to the runner
 # user when it fills each volume for the first time.
 RUN mkdir -p /home/runner/.cache /home/runner/.local/share/pnpm /home/runner/.npm \
-    /opt/hostedtoolcache \
+    /home/runner/_work /opt/hostedtoolcache \
   && chown -R runner:runner /home/runner/.cache /home/runner/.local /home/runner/.npm \
-    /opt/hostedtoolcache
+    /home/runner/_work /opt/hostedtoolcache
 
 COPY --chmod=755 entrypoint.sh /usr/local/bin/ghpool-runner
 

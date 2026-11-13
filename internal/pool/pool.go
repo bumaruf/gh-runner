@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"path"
 	"regexp"
 	"runtime"
@@ -29,14 +30,22 @@ type Config struct {
 	Slots int
 	// Labels are the custom labels jobs use to target the pool, besides self-hosted, linux and
 	// the architecture.
-	Labels   []string
-	Image    string
-	NanoCPUs int64
-	Memory   int64
+	Labels []string
+	Image  string
+	// CPUs per job; 0 means no limit. A whole number that fits pins each slot to its own CPUs.
+	CPUs   float64
+	Memory int64
+
+	// Docker gives every job its own Docker daemon, in a privileged container beside the
+	// runner, for services:, container: and docker build.
+	Docker    bool
+	DindImage string
 
 	PollInterval time.Duration
 	IdleTimeout  time.Duration
 	RepoRefresh  time.Duration
+	// CacheTTL is how long a repo may go without runs before its caches are deleted.
+	CacheTTL time.Duration
 
 	// Include and Exclude are path.Match patterns on owner/repo; an empty Include takes all.
 	Include, Exclude []string
@@ -52,9 +61,25 @@ const (
 	labelRepo     = "ghpool.repo"
 	labelRunnerID = "ghpool.runner-id"
 	labelSlot     = "ghpool.slot"
+	labelRole     = "ghpool.role"
+	labelKind     = "ghpool.kind"
+	labelWork     = "ghpool.work"
+
+	roleRunner = "runner"
+	roleDocker = "docker"
+
+	workDir      = "/home/runner/_work"
+	externalsDir = "/home/runner/externals"
+
+	// The job's Docker would take 172.17.0.0/16 for its bridge, the same default as the host's.
+	// Sharing its network namespace, the runner would then lose any host service on that
+	// range, such as a DNS server Docker hands to containers at 172.17.0.1.
+	dindBridge = "--bip=10.249.0.1/24"
+	dindPools  = "--default-address-pool=base=10.250.0.0/16,size=24"
 
 	orphanGrace = 2 * time.Minute
 	orphanSweep = 5 * time.Minute
+	volumeSweep = time.Hour
 	queueLag    = 30 * time.Second
 	// A tick finishes even after a stop signal: cut short, a runner can end up registered on
 	// GitHub with no container behind it.
@@ -66,15 +91,6 @@ const (
 	repoConcurrency   = 8
 )
 
-// slotCaches are the per-slot volumes. A slot runs one job at a time, so no two jobs write
-// the same cache at once; jobs of different repos do share a slot's caches over time.
-var slotCaches = []struct{ suffix, target string }{
-	{"cache", "/home/runner/.cache"},
-	{"pnpm", "/home/runner/.local/share/pnpm"},
-	{"npm", "/home/runner/.npm"},
-	{"toolcache", "/opt/hostedtoolcache"},
-}
-
 type Pool struct {
 	cfg    Config
 	gh     *github.Client
@@ -83,15 +99,21 @@ type Pool struct {
 
 	registerLabels []string
 	accepts        map[string]bool
+	ownName        *regexp.Regexp
+	hostCPUs       int
 
-	repos       []string
-	reposAt     time.Time
-	ownName     *regexp.Regexp
-	sweptAt     time.Time
-	failures    map[string]failure
-	busySince   map[int64]time.Time
-	lastSummary time.Time
-	lastState   string
+	repos     []string
+	reposAt   time.Time
+	lastRunMu sync.Mutex
+	lastRun   map[string]time.Time
+
+	sweptAt        time.Time
+	volumesSweptAt time.Time
+	externals      map[string]string // runner image ID → its externals volume
+	failures       map[string]failure
+	busySince      map[int64]time.Time
+	lastSummary    time.Time
+	lastState      string
 }
 
 type failure struct {
@@ -118,6 +140,8 @@ func New(cfg Config, gh *github.Client, dockerClient *docker.Client, log *slog.L
 		registerLabels: labels,
 		accepts:        accepts,
 		ownName:        regexp.MustCompile("^" + regexp.QuoteMeta(cfg.Name) + `-\d+-[0-9a-f]{6}$`),
+		lastRun:        map[string]time.Time{},
+		externals:      map[string]string{},
 		failures:       map[string]failure{},
 		busySince:      map[int64]time.Time{},
 	}
@@ -131,12 +155,22 @@ func (p *Pool) Run(ctx context.Context) error {
 	if !exists {
 		return fmt.Errorf("runner image %s not found; build it with `docker compose build`", p.cfg.Image)
 	}
+	if p.cfg.Docker {
+		if err := p.ensureImage(ctx, p.cfg.DindImage); err != nil {
+			return err
+		}
+	}
+	if p.hostCPUs, err = p.docker.CPUs(ctx); err != nil {
+		return fmt.Errorf("read host CPUs: %w", err)
+	}
 	for slot := 1; slot <= p.cfg.Slots; slot++ {
 		if err := p.docker.EnsureNetwork(ctx, p.network(slot), map[string]string{labelPool: p.cfg.Name}); err != nil {
 			return fmt.Errorf("create network of slot %d: %w", slot, err)
 		}
 	}
-	p.log.Info("pool started", "pool", p.cfg.Name, "slots", p.cfg.Slots, "labels", p.registerLabels, "image", p.cfg.Image)
+	p.log.Info("pool started", "pool", p.cfg.Name, "slots", p.cfg.Slots, "labels", p.registerLabels,
+		"image", p.cfg.Image, "docker_in_jobs", p.cfg.Docker, "cpus_per_job", p.cfg.CPUs,
+		"pinned_cpus", cpuset(1, p.cfg.Slots, p.wholeCPUs(), p.hostCPUs) != "")
 
 	for {
 		started := time.Now()
@@ -154,6 +188,24 @@ func (p *Pool) Run(ctx context.Context) error {
 	}
 }
 
+func (p *Pool) ensureImage(ctx context.Context, ref string) error {
+	exists, err := p.docker.ImageExists(ctx, ref)
+	if err != nil {
+		return fmt.Errorf("check image %s: %w", ref, err)
+	}
+	if exists {
+		return nil
+	}
+	p.log.Info("pulling image", "image", ref)
+	if err := p.docker.Pull(ctx, ref); err != nil {
+		return fmt.Errorf("pull %s: %w", ref, err)
+	}
+	if exists, err = p.docker.ImageExists(ctx, ref); err != nil || !exists {
+		return fmt.Errorf("image %s still missing after the pull: %v", ref, err)
+	}
+	return nil
+}
+
 func (p *Pool) tick(ctx context.Context) error {
 	now := time.Now()
 	if p.repos == nil || now.Sub(p.reposAt) >= p.cfg.RepoRefresh {
@@ -166,7 +218,7 @@ func (p *Pool) tick(ctx context.Context) error {
 		return fmt.Errorf("list runner containers: %w", err)
 	}
 	runners := p.observe(ctx, containers, now)
-	p.sweepOrphans(ctx, now, containers)
+	p.sweepOrphans(ctx, now, runners)
 
 	decided := plan(planInput{
 		Slots:       p.cfg.Slots,
@@ -184,6 +236,7 @@ func (p *Pool) tick(ctx context.Context) error {
 	for _, spawn := range decided.Spawn {
 		p.spawn(ctx, spawn, now)
 	}
+	p.sweepVolumes(ctx, now)
 
 	p.gh.PruneCache(cacheMaxIdle)
 	p.summarize(now, runners, decided, queued)
@@ -262,12 +315,19 @@ func (p *Pool) queuedJobs(ctx context.Context) []QueuedJob {
 }
 
 func (p *Pool) repoQueuedJobs(ctx context.Context, repo string) ([]QueuedJob, error) {
-	runs, err := p.gh.ActiveRuns(ctx, repo)
+	runs, err := p.gh.RecentRuns(ctx, repo)
 	if err != nil {
 		return nil, err
 	}
+	var latest time.Time
 	var queued []QueuedJob
 	for _, run := range runs {
+		if run.CreatedAt.After(latest) {
+			latest = run.CreatedAt
+		}
+		if !run.Active() {
+			continue
+		}
 		jobs, err := p.gh.RunJobs(ctx, repo, run.ID)
 		if err != nil {
 			return nil, err
@@ -278,6 +338,9 @@ func (p *Pool) repoQueuedJobs(ctx context.Context, repo string) ([]QueuedJob, er
 			}
 		}
 	}
+	p.lastRunMu.Lock()
+	p.lastRun[repo] = latest
+	p.lastRunMu.Unlock()
 	return queued, nil
 }
 
@@ -295,11 +358,36 @@ func (p *Pool) acceptsLabels(labels []string) bool {
 	return true
 }
 
+// observe pairs each runner container with its Docker sidecar and asks GitHub how the runner
+// stands. A sidecar left without its runner shows up as an exited runner, so it gets removed.
 func (p *Pool) observe(ctx context.Context, containers []docker.Container, now time.Time) []Runner {
+	byKey := map[string]*Runner{}
+	var order []string
+	for _, c := range containers {
+		key := c.Labels[labelRepo] + "#" + c.Labels[labelRunnerID]
+		r, seen := byKey[key]
+		if !seen {
+			r = &Runner{Repo: c.Labels[labelRepo], ExitedClean: true}
+			r.RunnerID, _ = strconv.ParseInt(c.Labels[labelRunnerID], 10, 64)
+			r.Slot, _ = strconv.Atoi(c.Labels[labelSlot])
+			byKey[key] = r
+			order = append(order, key)
+		}
+		r.WorkVolume = firstNonEmpty(r.WorkVolume, c.Labels[labelWork])
+		if c.Labels[labelRole] == roleDocker {
+			r.SidecarID = c.ID
+			continue
+		}
+		r.ContainerID = c.ID
+		r.StartedAt = time.Unix(c.Created, 0)
+		r.Running = c.Running()
+		r.ExitedClean = c.ExitedCleanly()
+	}
+
 	registered := map[string]map[int64]github.Runner{}
 	unknown := map[string]bool{}
-	for _, c := range containers {
-		repo := c.Labels[labelRepo]
+	for _, key := range order {
+		repo := byKey[key].Repo
 		if _, seen := registered[repo]; seen || unknown[repo] {
 			continue
 		}
@@ -318,17 +406,9 @@ func (p *Pool) observe(ctx context.Context, containers []docker.Container, now t
 		registered[repo] = byID
 	}
 
-	runners := make([]Runner, 0, len(containers))
-	for _, c := range containers {
-		r := Runner{
-			Repo:        c.Labels[labelRepo],
-			ContainerID: c.ID,
-			StartedAt:   time.Unix(c.Created, 0),
-			Running:     c.Running(),
-			ExitedClean: c.ExitedCleanly(),
-		}
-		r.RunnerID, _ = strconv.ParseInt(c.Labels[labelRunnerID], 10, 64)
-		r.Slot, _ = strconv.Atoi(c.Labels[labelSlot])
+	runners := make([]Runner, 0, len(order))
+	for _, key := range order {
+		r := byKey[key]
 		if unknown[r.Repo] {
 			r.Registered, r.Busy = true, true
 		} else {
@@ -342,7 +422,7 @@ func (p *Pool) observe(ctx context.Context, containers []docker.Container, now t
 			}
 		}
 		r.BusySince = p.busySince[r.RunnerID]
-		runners = append(runners, r)
+		runners = append(runners, *r)
 	}
 	for id := range p.busySince {
 		if !slices.ContainsFunc(runners, func(r Runner) bool { return r.RunnerID == id }) {
@@ -352,24 +432,31 @@ func (p *Pool) observe(ctx context.Context, containers []docker.Container, now t
 	return runners
 }
 
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
+}
+
 // sweepOrphans deregisters runners of this pool that GitHub still lists, offline, with no
 // container behind them: what a crash between registering a runner and starting its
 // container leaves. GitHub would only drop them after a day.
-func (p *Pool) sweepOrphans(ctx context.Context, now time.Time, containers []docker.Container) {
+func (p *Pool) sweepOrphans(ctx context.Context, now time.Time, runners []Runner) {
 	if now.Sub(p.sweptAt) < orphanSweep {
 		return
 	}
 	p.sweptAt = now
 	backed := map[string]bool{}
-	for _, c := range containers {
-		backed[c.Labels[labelRepo]+"#"+c.Labels[labelRunnerID]] = true
+	for _, r := range runners {
+		backed[r.Repo+"#"+strconv.FormatInt(r.RunnerID, 10)] = true
 	}
 	for _, repo := range p.repos {
-		runners, err := p.gh.Runners(ctx, repo)
+		list, err := p.gh.Runners(ctx, repo)
 		if err != nil {
 			continue
 		}
-		for _, r := range runners {
+		for _, r := range list {
 			if !p.ownName.MatchString(r.Name) || r.Busy || r.Status != "offline" ||
 				backed[repo+"#"+strconv.FormatInt(r.ID, 10)] {
 				continue
@@ -383,11 +470,70 @@ func (p *Pool) sweepOrphans(ctx context.Context, now time.Time, containers []doc
 	}
 }
 
+// sweepVolumes deletes the volumes nothing will use again, once an hour.
+func (p *Pool) sweepVolumes(ctx context.Context, now time.Time) {
+	if now.Sub(p.volumesSweptAt) < volumeSweep {
+		return
+	}
+	p.volumesSweptAt = now
+	volumes, err := p.docker.Volumes(ctx, labelPool+"="+p.cfg.Name)
+	if err != nil {
+		p.log.Warn("could not list volumes", "err", err)
+		return
+	}
+	containers, err := p.docker.Containers(ctx, labelPool+"="+p.cfg.Name)
+	if err != nil {
+		p.log.Warn("could not list runner containers", "err", err)
+		return
+	}
+	live := map[string]bool{}
+	for _, c := range containers {
+		live[c.Labels[labelRunnerID]] = true
+	}
+	served := map[string]bool{}
+	for _, repo := range p.repos {
+		served[repo] = true
+	}
+	p.lastRunMu.Lock()
+	lastRun := map[string]time.Time{}
+	for repo, at := range p.lastRun {
+		lastRun[repo] = at
+	}
+	p.lastRunMu.Unlock()
+	current := ""
+	if id, err := p.docker.ImageID(ctx, p.cfg.Image); err == nil {
+		current = p.externalsVolume(id)
+	}
+
+	for _, name := range staleVolumes(sweepInput{
+		Volumes: volumes, Served: served, LastRun: lastRun, LiveRunners: live,
+		Externals: current, Now: now, CacheTTL: p.cfg.CacheTTL,
+	}) {
+		if err := p.docker.RemoveVolume(ctx, name); err != nil {
+			if !docker.IsConflict(err) {
+				p.log.Warn("could not remove volume", "volume", name, "err", err)
+			}
+			continue
+		}
+		p.log.Info("volume removed", "volume", name)
+	}
+}
+
 func (p *Pool) remove(ctx context.Context, removal Removal, now time.Time) {
 	r := removal.Runner
-	if err := p.docker.Remove(ctx, r.ContainerID); err != nil {
-		p.log.Error("could not remove runner container", "repo", r.Repo, "slot", r.Slot, "err", err)
-		return
+	for _, id := range []string{r.ContainerID, r.SidecarID} {
+		if id == "" {
+			continue
+		}
+		if err := p.docker.Remove(ctx, id); err != nil {
+			p.log.Error("could not remove runner container", "repo", r.Repo, "slot", r.Slot, "err", err)
+			return
+		}
+	}
+	if r.WorkVolume != "" {
+		if err := p.docker.RemoveVolume(ctx, r.WorkVolume); err != nil {
+			p.log.Warn("could not remove work volume", "volume", r.WorkVolume, "err", err)
+		}
 	}
 	if r.Registered && r.RunnerID != 0 {
 		if err := p.gh.DeleteRunner(ctx, r.Repo, r.RunnerID); err != nil {
@@ -408,32 +554,164 @@ func (p *Pool) spawn(ctx context.Context, s Spawn, now time.Time) {
 		p.fail(s.Repo, now)
 		return
 	}
-	containerID, err := p.docker.Run(ctx, name, docker.Spec{
-		Image: p.cfg.Image,
-		Env:   []string{"RUNNER_JITCONFIG=" + jitConfig},
-		Labels: map[string]string{
-			labelPool:     p.cfg.Name,
-			labelRepo:     s.Repo,
-			labelRunnerID: strconv.FormatInt(runnerID, 10),
-			labelSlot:     strconv.Itoa(s.Slot),
-		},
-		Mounts:   p.mounts(s.Slot),
-		Network:  p.network(s.Slot),
-		NanoCPUs: p.cfg.NanoCPUs,
-		Memory:   p.cfg.Memory,
-	})
+	created, err := p.startJob(ctx, name, runnerID, jitConfig, s)
 	if err != nil {
-		p.log.Error("could not start runner container", "repo", s.Repo, "slot", s.Slot, "err", err)
-		if containerID != "" {
-			_ = p.docker.Remove(ctx, containerID)
+		p.log.Error("could not start runner", "repo", s.Repo, "slot", s.Slot, "err", err)
+		for _, id := range created {
+			_ = p.docker.Remove(ctx, id)
 		}
+		_ = p.docker.RemoveVolume(ctx, name+"-work")
 		if err := p.gh.DeleteRunner(ctx, s.Repo, runnerID); err != nil {
 			p.log.Warn("could not deregister runner", "repo", s.Repo, "runner_id", runnerID, "err", err)
 		}
 		p.fail(s.Repo, now)
 		return
 	}
-	p.log.Info("runner started", "repo", s.Repo, "slot", s.Slot, "runner", name)
+	p.log.Info("runner started", "repo", s.Repo, "slot", s.Slot, "runner", name, "docker", p.cfg.Docker)
+}
+
+// startJob starts a job's containers and returns the IDs it created, for cleanup on failure.
+// With Docker on, the job's daemon starts first and the runner joins its network namespace:
+// ports that services: publish on the daemon are then on the runner's localhost, as on a
+// GitHub-hosted runner. Both share the work folder at the same path, so the bind mounts the
+// runner asks the daemon for resolve to the same files.
+func (p *Pool) startJob(ctx context.Context, name string, runnerID int64, jitConfig string, s Spawn) ([]string, error) {
+	labels := func(role string) map[string]string {
+		return map[string]string{
+			labelPool:     p.cfg.Name,
+			labelRepo:     s.Repo,
+			labelRunnerID: strconv.FormatInt(runnerID, 10),
+			labelSlot:     strconv.Itoa(s.Slot),
+			labelRole:     role,
+			labelWork:     name + "-work",
+		}
+	}
+	volumeLabels := func(kind string) map[string]string {
+		return map[string]string{
+			labelPool: p.cfg.Name, labelRepo: s.Repo, labelKind: kind,
+			labelRunnerID: strconv.FormatInt(runnerID, 10),
+		}
+	}
+
+	mounts := make([]docker.Mount, 0, len(jobCaches)+1)
+	for _, cache := range jobCaches {
+		volume := cacheVolume(p.cfg.Name, s.Repo, s.Slot, cache.suffix)
+		if err := p.docker.EnsureVolume(ctx, volume, volumeLabels(kindCache)); err != nil {
+			return nil, fmt.Errorf("create cache volume: %w", err)
+		}
+		mounts = append(mounts, docker.Mount{Source: volume, Target: cache.target})
+	}
+	work := docker.Mount{Source: name + "-work", Target: workDir}
+	if err := p.docker.EnsureVolume(ctx, work.Source, volumeLabels(kindWork)); err != nil {
+		return nil, fmt.Errorf("create work volume: %w", err)
+	}
+	mounts = append(mounts, work)
+
+	cpus, nanoCPUs := cpuset(s.Slot, p.cfg.Slots, p.wholeCPUs(), p.hostCPUs), int64(0)
+	if cpus == "" {
+		nanoCPUs = int64(p.cfg.CPUs * 1e9)
+	}
+	network := p.network(s.Slot)
+	env := []string{"RUNNER_JITCONFIG=" + jitConfig}
+	var created []string
+
+	if p.cfg.Docker {
+		externals, err := p.ensureExternals(ctx)
+		if err != nil {
+			return nil, err
+		}
+		store := cacheVolume(p.cfg.Name, s.Repo, s.Slot, dockerCache.suffix)
+		if err := p.docker.EnsureVolume(ctx, store, volumeLabels(kindCache)); err != nil {
+			return nil, fmt.Errorf("create docker cache volume: %w", err)
+		}
+		sidecar, err := p.docker.Run(ctx, name+"-docker", docker.Spec{
+			Image: p.cfg.DindImage,
+			Cmd:   []string{dindBridge, dindPools},
+			// No TLS: the daemon is reachable only from the runner, through the shared
+			// network namespace, and from nothing else on the slot's own network.
+			Env:    []string{"DOCKER_TLS_CERTDIR="},
+			Labels: labels(roleDocker),
+			Mounts: []docker.Mount{
+				work,
+				{Source: externals, Target: externalsDir, ReadOnly: true},
+				{Source: store, Target: dockerCache.target},
+			},
+			Network:    network,
+			Privileged: true,
+			CpusetCpus: cpus,
+			NanoCPUs:   nanoCPUs,
+			Memory:     p.cfg.Memory,
+		})
+		if sidecar != "" {
+			created = append(created, sidecar)
+		}
+		if err != nil {
+			return created, fmt.Errorf("start the job's docker: %w", err)
+		}
+		network = "container:" + sidecar
+		env = append(env, "DOCKER_HOST=tcp://localhost:2375")
+	}
+
+	runner, err := p.docker.Run(ctx, name, docker.Spec{
+		Image:      p.cfg.Image,
+		Env:        env,
+		Labels:     labels(roleRunner),
+		Mounts:     mounts,
+		Network:    network,
+		Init:       true,
+		CpusetCpus: cpus,
+		NanoCPUs:   nanoCPUs,
+		Memory:     p.cfg.Memory,
+	})
+	if runner != "" {
+		created = append(created, runner)
+	}
+	return created, err
+}
+
+// ensureExternals returns the volume holding the runner image's externals (the Node builds
+// the runner puts in job containers), filling it once per image build. A job's Docker needs
+// them at the same path to run `container:` jobs.
+func (p *Pool) ensureExternals(ctx context.Context) (string, error) {
+	imageID, err := p.docker.ImageID(ctx, p.cfg.Image)
+	if err != nil {
+		return "", fmt.Errorf("read runner image ID: %w", err)
+	}
+	if volume, ok := p.externals[imageID]; ok {
+		return volume, nil
+	}
+	volume := p.externalsVolume(imageID)
+	exists, err := p.docker.VolumeExists(ctx, volume)
+	if err != nil {
+		return "", err
+	}
+	if !exists {
+		labels := map[string]string{labelPool: p.cfg.Name, labelKind: kindExternals}
+		if err := p.docker.EnsureVolume(ctx, volume, labels); err != nil {
+			return "", fmt.Errorf("create externals volume: %w", err)
+		}
+		mount := []docker.Mount{{Source: volume, Target: externalsDir}}
+		if err := p.docker.Seed(ctx, p.cfg.Image, mount); err != nil {
+			_ = p.docker.RemoveVolume(ctx, volume)
+			return "", fmt.Errorf("fill externals volume: %w", err)
+		}
+	}
+	p.externals[imageID] = volume
+	return volume, nil
+}
+
+func (p *Pool) externalsVolume(imageID string) string {
+	id := strings.TrimPrefix(imageID, "sha256:")
+	return fmt.Sprintf("ghpool-%s-externals-%s", p.cfg.Name, id[:min(12, len(id))])
+}
+
+// wholeCPUs is the per-job CPU count when it is a whole number, the only case a slot can be
+// pinned to its own CPUs.
+func (p *Pool) wholeCPUs() int {
+	if p.cfg.CPUs <= 0 || p.cfg.CPUs != math.Trunc(p.cfg.CPUs) {
+		return 0
+	}
+	return int(p.cfg.CPUs)
 }
 
 // fail backs a repo off exponentially, from 10 seconds up to 5 minutes, so a runner that
@@ -478,14 +756,14 @@ func (p *Pool) nextWait(elapsed time.Duration) time.Duration {
 
 // summarize logs the pool's state when it changes, and every few minutes regardless.
 func (p *Pool) summarize(now time.Time, runners []Runner, decided Plan, queued []QueuedJob) {
-	removed := map[string]bool{}
+	removed := map[int64]bool{}
 	for _, r := range decided.Remove {
-		removed[r.Runner.ContainerID] = true
+		removed[r.Runner.RunnerID] = true
 	}
 	busy, waiting := 0, len(decided.Spawn)
 	for _, r := range runners {
 		switch {
-		case removed[r.ContainerID]:
+		case removed[r.RunnerID]:
 		case r.Busy:
 			busy++
 		default:
@@ -505,15 +783,6 @@ func (p *Pool) summarize(now time.Time, runners []Runner, decided Plan, queued [
 }
 
 func (p *Pool) network(slot int) string { return fmt.Sprintf("ghpool-%s-slot%d", p.cfg.Name, slot) }
-
-func (p *Pool) mounts(slot int) []docker.Mount {
-	mounts := make([]docker.Mount, 0, len(slotCaches))
-	for _, cache := range slotCaches {
-		source := fmt.Sprintf("ghpool-%s-slot%d-%s", p.cfg.Name, slot, cache.suffix)
-		mounts = append(mounts, docker.Mount{Source: source, Target: cache.target})
-	}
-	return mounts
-}
 
 func runnerArch() string {
 	if runtime.GOARCH == "arm64" {
