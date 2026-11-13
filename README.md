@@ -72,7 +72,7 @@ O pool precisa registrar runners nos repos e ler os runs.
 
 ## Subir o pool
 
-Num host com Docker e o plugin compose (no Ubuntu da Oracle, rode antes `sudo ./host-setup.sh`):
+Num host com Docker e o plugin compose (num Ubuntu novo, rode antes `sudo ./host-setup.sh`):
 
 ```bash
 cp .env.example .env    # e preencha
@@ -90,7 +90,7 @@ docker compose down
 
 O serviço termina o ciclo em andamento antes de sair. Os jobs que estão rodando continuam e são adotados quando ele voltar.
 
-Rode uma única instância por `POOL_NAME`. Hosts diferentes (o PC e a VM da Oracle, por exemplo) usam nomes diferentes e podem atender os mesmos repos ao mesmo tempo.
+Rode uma única instância por `POOL_NAME`. Hosts diferentes (um PC e uma VM, por exemplo) usam nomes diferentes e podem atender os mesmos repos ao mesmo tempo.
 
 ## Configuração
 
@@ -131,32 +131,6 @@ docker compose up -d --build
 ```
 
 Os próximos jobs já usam a imagem nova. O runner também se atualiza sozinho quando o GitHub exige uma versão mais nova.
-
-## Criar a VM na Oracle
-
-Uma `VM.Standard.A1.Flex` (Ampere, arm64) com Ubuntu 24.04 aarch64, 2 OCPU, 12 GB de RAM e 100 GB de disco cabe no Always Free. A Oracle costuma responder "Out of capacity" para esse shape, e a saída é tentar de novo até conseguir. O `oracle-launch.sh` faz isso com a OCI CLI configurada em `~/.oci/config`:
-
-```bash
-OCI_CLI_PROFILE=DEFAULT \
-OCI_SUBNET_ID=ocid1.subnet... \
-OCI_IMAGE_ID=ocid1.image... \
-./oracle-launch.sh
-```
-
-- A subnet precisa ser pública, numa VCN com internet gateway e rota `0.0.0.0/0`.
-- A imagem é a `Canonical-Ubuntu-24.04-aarch64-*` da região.
-- Opcionais: `OCI_COMPARTMENT_ID` (padrão: a tenancy do perfil), `OCI_AD` (padrão: o primeiro AD), `OCPUS` (2), `MEMORY_GB` (12), `BOOT_GB` (100), `NAME` (`gh-runner`), `RETRY_SECONDS` (60), `SSH_PUBLIC_KEY` (`~/.ssh/gh-runner-oracle_ed25519.pub`).
-- Com mais de uma conta, rode um por conta, cada um com seu `OCI_CLI_PROFILE`.
-
-O script para quando a VM fica `RUNNING`, mostra o IP público e avisa com `notify-send`. Para deixar rodando sem o terminal:
-
-```bash
-setsid nohup env OCI_CLI_PROFILE=DEFAULT OCI_SUBNET_ID=... OCI_IMAGE_ID=... ./oracle-launch.sh > launch.log 2>&1 < /dev/null &
-```
-
-Com a VM de pé, clone este repo nela, rode `sudo ./host-setup.sh`, entre de novo por SSH e suba o pool com um `POOL_NAME` próprio.
-
-**Recuperação de instância ociosa.** Numa conta só Always Free, a Oracle pode desligar uma instância que passa 7 dias com CPU, rede e memória abaixo de 20%. Um pool parado fica assim. Para evitar, converta a conta para Pay As You Go: o uso dentro do Always Free continua sem custo e a regra deixa de valer.
 
 ## Desenvolvimento
 

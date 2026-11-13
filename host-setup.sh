@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Prepares a fresh Ubuntu host (such as the Oracle VM) to run ghpool. Run once as root:
+# Prepares a fresh Ubuntu host (a cloud VM, say) to run ghpool. Run once as root:
 #   sudo ./host-setup.sh
 # Idempotent.
 set -euo pipefail
