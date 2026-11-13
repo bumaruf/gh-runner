@@ -48,8 +48,10 @@ Também dá para fixar `runs-on: [self-hosted, gh-runner]` direto no workflow.
 O workflow `selftest` deste repo dispara 3 jobs ao mesmo tempo no pool e confere runner, caches, `setup-node` e `sudo`:
 
 ```bash
-gh workflow run selftest.yml --repo bumaruf/gh-runner
+gh workflow run selftest.yml --repo <owner>/gh-runner
 ```
+
+Como o pool ignora repos públicos por padrão, rode o `selftest` num fork privado deste repo, ou num pool com `ALLOW_PUBLIC_REPOS=true` restrito a ele por `REPOS_INCLUDE`.
 
 ## Credencial
 

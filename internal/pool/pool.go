@@ -55,6 +55,7 @@ const (
 
 	orphanGrace = 2 * time.Minute
 	orphanSweep = 5 * time.Minute
+	queueLag    = 30 * time.Second
 	// A tick finishes even after a stop signal: cut short, a runner can end up registered on
 	// GitHub with no container behind it.
 	tickTimeout     = 2 * time.Minute
@@ -88,6 +89,7 @@ type Pool struct {
 	ownName     *regexp.Regexp
 	sweptAt     time.Time
 	failures    map[string]failure
+	busySince   map[int64]time.Time
 	lastSummary time.Time
 	lastState   string
 }
@@ -117,6 +119,7 @@ func New(cfg Config, gh *github.Client, dockerClient *docker.Client, log *slog.L
 		accepts:        accepts,
 		ownName:        regexp.MustCompile("^" + regexp.QuoteMeta(cfg.Name) + `-\d+-[0-9a-f]{6}$`),
 		failures:       map[string]failure{},
+		busySince:      map[int64]time.Time{},
 	}
 }
 
@@ -162,7 +165,7 @@ func (p *Pool) tick(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list runner containers: %w", err)
 	}
-	runners := p.observe(ctx, containers)
+	runners := p.observe(ctx, containers, now)
 	p.sweepOrphans(ctx, now, containers)
 
 	decided := plan(planInput{
@@ -173,6 +176,7 @@ func (p *Pool) tick(ctx context.Context) error {
 		IdleTimeout: p.cfg.IdleTimeout,
 		OrphanGrace: orphanGrace,
 		Blocked:     p.blocked(now),
+		QueueLag:    queueLag,
 	})
 	for _, removal := range decided.Remove {
 		p.remove(ctx, removal, now)
@@ -291,7 +295,7 @@ func (p *Pool) acceptsLabels(labels []string) bool {
 	return true
 }
 
-func (p *Pool) observe(ctx context.Context, containers []docker.Container) []Runner {
+func (p *Pool) observe(ctx context.Context, containers []docker.Container, now time.Time) []Runner {
 	registered := map[string]map[int64]github.Runner{}
 	unknown := map[string]bool{}
 	for _, c := range containers {
@@ -332,9 +336,18 @@ func (p *Pool) observe(ctx context.Context, containers []docker.Container) []Run
 			r.Registered, r.Busy = ok, ok && gr.Busy
 			if r.Busy {
 				delete(p.failures, r.Repo)
+				if _, seen := p.busySince[r.RunnerID]; !seen {
+					p.busySince[r.RunnerID] = now
+				}
 			}
 		}
+		r.BusySince = p.busySince[r.RunnerID]
 		runners = append(runners, r)
+	}
+	for id := range p.busySince {
+		if !slices.ContainsFunc(runners, func(r Runner) bool { return r.RunnerID == id }) {
+			delete(p.busySince, id)
+		}
 	}
 	return runners
 }

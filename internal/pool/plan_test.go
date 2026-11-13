@@ -135,3 +135,19 @@ func TestABlockedRepoGetsNoRunnerButOthersStillDo(t *testing.T) {
 		t.Fatalf("spawn = %v, want %v", p.Spawn, want)
 	}
 }
+
+// GitHub lists a job as queued for a few seconds after a runner took it.
+func TestARunnerThatJustTookAJobStillCoversItWhileTheQueueLags(t *testing.T) {
+	justBusy := runner("me/web", 1, 20*time.Second, true)
+	justBusy.BusySince = t0.Add(-5 * time.Second)
+	busyForLong := runner("me/api", 2, time.Minute, true)
+	busyForLong.BusySince = t0.Add(-time.Minute)
+
+	in := input(4, []Runner{justBusy, busyForLong}, job("me/web", 1, time.Minute), job("me/api", 2, time.Minute))
+	in.QueueLag = 30 * time.Second
+	p := plan(in)
+
+	if want := []Spawn{{Repo: "me/api", Slot: 3}}; !slices.Equal(p.Spawn, want) {
+		t.Fatalf("spawn = %v, want only me/api: the me/web job is the one its runner just took", p.Spawn)
+	}
+}

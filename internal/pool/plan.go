@@ -26,6 +26,8 @@ type Runner struct {
 	// a runner is never removed on missing information.
 	Registered bool
 	Busy       bool
+	// BusySince is when the pool first saw the runner busy.
+	BusySince time.Time
 }
 
 type Removal struct {
@@ -60,6 +62,9 @@ type planInput struct {
 	OrphanGrace time.Duration
 	// Blocked repos get no new runner, after their runners kept failing to start.
 	Blocked map[string]bool
+	// QueueLag is how long GitHub may still list a job as queued after a runner took it.
+	// Until then, a runner that just became busy still covers one queued job of its repo.
+	QueueLag time.Duration
 }
 
 // plan decides what to remove and which slot gets a runner for which repo. Each runner that is
@@ -85,7 +90,7 @@ func plan(in planInput) Plan {
 			p.Remove = append(p.Remove, Removal{r, reasonIdle})
 		default:
 			usedSlots[r.Slot] = true
-			if !r.Busy {
+			if !r.Busy || in.Now.Sub(r.BusySince) < in.QueueLag {
 				waiting[r.Repo]++
 			}
 		}
