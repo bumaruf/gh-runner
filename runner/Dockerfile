@@ -12,8 +12,18 @@ ARG PLAYWRIGHT_VERSION=1.65.0
 
 USER root
 
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends xz-utils jq zstd \
+# Tools that GitHub-hosted images ship and workflows take for granted: the GitHub CLI (steps
+# that comment on pull requests), a compiler toolchain for native npm modules (node-gyp),
+# and the usual archive, transfer and scripting tools.
+RUN mkdir -p -m 755 /etc/apt/keyrings \
+  && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+    -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+  && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+    > /etc/apt/sources.list.d/github-cli.list \
+  && apt-get update \
+  && apt-get install -y --no-install-recommends gh xz-utils jq zstd zip wget rsync \
+    build-essential python3-pip sqlite3 \
   && PATH="/home/runner/externals/node20/bin:$PATH" \
     npx --yes "playwright@${PLAYWRIGHT_VERSION}" install-deps chromium \
   && rm -rf /var/lib/apt/lists/* /root/.npm
