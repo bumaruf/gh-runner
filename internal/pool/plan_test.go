@@ -112,6 +112,18 @@ func TestAnIdleRunnerGoesOnlyAfterTheTimeoutAndWithoutDemandInItsRepo(t *testing
 	}
 }
 
+// Between its job ending and its container exiting, a runner is not busy; it is not idle either.
+func TestARunnerThatFinishedItsJobIsLeftToExitOnItsOwn(t *testing.T) {
+	finished := runner("me/web", 1, 10*time.Minute, false)
+	finished.BusySince = t0.Add(-9 * time.Minute)
+
+	p := plan(input(1, []Runner{finished}))
+
+	if len(p.Remove) != 0 {
+		t.Fatalf("removals = %+v, want none", p.Remove)
+	}
+}
+
 func TestARunnerGitHubNoLongerKnowsGoesAfterTheGrace(t *testing.T) {
 	fresh := runner("me/web", 1, time.Minute, false)
 	fresh.Registered = false

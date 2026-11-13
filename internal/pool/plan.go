@@ -48,7 +48,7 @@ type Plan struct {
 const (
 	reasonExited       = "container exited"
 	reasonUnregistered = "runner no longer registered on GitHub"
-	reasonIdle         = "idle with no queued job in its repo"
+	reasonIdle         = "never got a job, and its repo has none queued"
 )
 
 type planInput struct {
@@ -86,7 +86,7 @@ func plan(in planInput) Plan {
 			p.Remove = append(p.Remove, Removal{r, reasonExited})
 		case !r.Registered && age > in.OrphanGrace:
 			p.Remove = append(p.Remove, Removal{r, reasonUnregistered})
-		case !r.Busy && demand[r.Repo] == 0 && age > in.IdleTimeout:
+		case !r.Busy && r.BusySince.IsZero() && demand[r.Repo] == 0 && age > in.IdleTimeout:
 			p.Remove = append(p.Remove, Removal{r, reasonIdle})
 		default:
 			usedSlots[r.Slot] = true
