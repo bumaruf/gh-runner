@@ -1,0 +1,28 @@
+name: ghpool
+
+services:
+  # Builds the image of the ephemeral runners and exits; ghpool starts containers from it.
+  runner-image:
+    build:
+      context: ./runner
+      args:
+        RUNNER_VERSION: ${RUNNER_VERSION:-2.338.2}
+    image: ghpool-runner:${RUNNER_VERSION:-2.338.2}
+    entrypoint: ["true"]
+    restart: "no"
+
+  ghpool:
+    build: .
+    image: ghpool:local
+    restart: unless-stopped
+    depends_on:
+      runner-image:
+        condition: service_completed_successfully
+    env_file: .env
+    environment:
+      RUNNER_IMAGE: ghpool-runner:${RUNNER_VERSION:-2.338.2}
+    volumes:
+      # ghpool drives Docker to start and remove the runner containers. The runners themselves
+      # never get the socket.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./secrets:/run/secrets:ro

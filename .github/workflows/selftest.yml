@@ -1,0 +1,27 @@
+# Checks a pool end to end: three jobs at once must each get their own ephemeral runner.
+name: selftest
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      matrix:
+        n: [1, 2, 3]
+    runs-on: [self-hosted, gh-runner]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Runner
+        run: |
+          echo "runner=$RUNNER_NAME arch=$RUNNER_ARCH cpus=$(nproc)"
+          free -h
+          df -h /home/runner
+      - name: Caches are writable
+        run: |
+          touch ~/.cache/ghpool-probe ~/.npm/ghpool-probe /opt/hostedtoolcache/ghpool-probe
+          ls -la ~/.cache /opt/hostedtoolcache | head
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node --version && sudo -n true && echo "sudo ok"
