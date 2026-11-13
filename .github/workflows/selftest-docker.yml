@@ -1,0 +1,49 @@
+# Checks a pool with RUNNER_DOCKER=true: Docker inside a job, services: and container:.
+# Runs on runners labelled ghpool-test, so it never lands on a pool serving real CI.
+name: selftest-docker
+
+on:
+  workflow_dispatch:
+
+jobs:
+  docker:
+    runs-on: [self-hosted, ghpool-test]
+    steps:
+      - uses: actions/checkout@v4
+      - name: CPUs this job gets
+        run: echo "nproc=$(nproc)"
+      - name: docker run
+        run: docker run --rm alpine:3.20 echo "hello from the job's docker"
+      - name: docker build
+        run: |
+          printf 'FROM alpine:3.20\nRUN echo built > /built\nCMD cat /built\n' > Dockerfile.selftest
+          docker build -q -t selftest:local -f Dockerfile.selftest .
+          docker run --rm selftest:local
+      - name: Bind mount of the work folder
+        run: docker run --rm -v "$PWD:/w" alpine:3.20 test -f /w/README.md
+
+  services:
+    runs-on: [self-hosted, ghpool-test]
+    services:
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+    steps:
+      - name: Service on localhost
+        run: |
+          exec 3<>/dev/tcp/localhost/6379
+          printf 'PING\r\n' >&3
+          read -r -t 5 reply <&3
+          echo "redis said: $reply"
+          [[ "$reply" == +PONG* ]]
+
+  container:
+    runs-on: [self-hosted, ghpool-test]
+    container: ubuntu:24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inside the job container
+        run: |
+          . /etc/os-release && echo "$PRETTY_NAME"
+          test -f README.md
