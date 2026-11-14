@@ -262,14 +262,17 @@ func (p *Pool) refreshRepos(ctx context.Context, now time.Time) {
 		}
 	}
 	slices.Sort(names)
-	if !slices.Equal(names, p.repos) {
+	if p.reposAt.IsZero() || !slices.Equal(names, p.repos) {
 		p.log.Info("serving repos", "count", len(names), "repos", names)
 	}
 	p.repos, p.reposAt = names, now
 }
 
 func (p *Pool) serves(repo github.Repo) bool {
-	if repo.Archived || !repo.CanAdminister() || (!repo.Private && !p.cfg.AllowPublic) {
+	// With a token, the repo's permissions block says whether the user may register runners
+	// there. An installation's repos carry the installation's own block instead, without
+	// admin: there the app's Administration permission is what counts.
+	if repo.Archived || (!p.cfg.AppAuth && !repo.CanAdminister()) || (!repo.Private && !p.cfg.AllowPublic) {
 		return false
 	}
 	if len(p.cfg.Include) > 0 && !matchesAny(p.cfg.Include, repo.FullName) {

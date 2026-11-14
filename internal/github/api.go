@@ -16,8 +16,7 @@ type Repo struct {
 	} `json:"permissions"`
 }
 
-// CanAdminister reports whether the token may register runners on the repo. Installation
-// repos carry no permissions block: the app's own permissions apply.
+// CanAdminister reports whether the token's user may register runners on the repo.
 func (r Repo) CanAdminister() bool { return r.Permissions == nil || r.Permissions.Admin }
 
 // InstallationRepos lists the repos a GitHub App installation reaches.

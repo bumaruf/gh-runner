@@ -76,3 +76,15 @@ func TestEachSlotGetsItsOwnCPUsWhenTheyFit(t *testing.T) {
 		t.Fatalf("6 slots of 5 CPUs do not fit on 24, got %q", got)
 	}
 }
+
+// Until the pool knows which repos it serves, every cache would look like a repo that left.
+func TestNoCacheIsStaleBeforeThePoolKnowsItsRepos(t *testing.T) {
+	got := staleVolumes(sweepInput{
+		Volumes: []docker.Volume{volume("web-cache", kindCache, labelRepo, "me/web")},
+		Now:     time.Now(),
+	})
+
+	if len(got) != 0 {
+		t.Fatalf("stale = %v, want none", got)
+	}
+}

@@ -71,6 +71,9 @@ func staleVolumes(in sweepInput) []string {
 	for _, v := range in.Volumes {
 		switch v.Labels[labelKind] {
 		case kindCache:
+			if len(in.Served) == 0 {
+				continue
+			}
 			repo := v.Labels[labelRepo]
 			last, known := in.LastRun[repo]
 			if !in.Served[repo] || (known && in.Now.Sub(last) > in.CacheTTL) {
