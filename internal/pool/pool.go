@@ -41,6 +41,10 @@ type Config struct {
 	Docker    bool
 	DindImage string
 
+	// ComposeProject is the Compose project ghpool runs under, if any. The job's containers
+	// carry its label so Docker UIs group them with the service.
+	ComposeProject string
+
 	PollInterval time.Duration
 	IdleTimeout  time.Duration
 	RepoRefresh  time.Duration
@@ -64,6 +68,10 @@ const (
 	labelRole     = "ghpool.role"
 	labelKind     = "ghpool.kind"
 	labelWork     = "ghpool.work"
+
+	// Without com.docker.compose.oneoff, Compose itself ignores the job's containers: neither
+	// down nor up --remove-orphans touch a job in flight.
+	labelComposeProject = "com.docker.compose.project"
 
 	roleRunner = "runner"
 	roleDocker = "docker"
@@ -573,6 +581,22 @@ func (p *Pool) spawn(ctx context.Context, s Spawn, now time.Time) {
 	p.log.Info("runner started", "repo", s.Repo, "slot", s.Slot, "runner", name, "docker", p.cfg.Docker)
 }
 
+// jobLabels are the labels of a job's container in the given role.
+func jobLabels(cfg Config, name string, runnerID int64, s Spawn, role string) map[string]string {
+	labels := map[string]string{
+		labelPool:     cfg.Name,
+		labelRepo:     s.Repo,
+		labelRunnerID: strconv.FormatInt(runnerID, 10),
+		labelSlot:     strconv.Itoa(s.Slot),
+		labelRole:     role,
+		labelWork:     name + "-work",
+	}
+	if cfg.ComposeProject != "" {
+		labels[labelComposeProject] = cfg.ComposeProject
+	}
+	return labels
+}
+
 // startJob starts a job's containers and returns the IDs it created, for cleanup on failure.
 // With Docker on, the job's daemon starts first and the runner joins its network namespace:
 // ports that services: publish on the daemon are then on the runner's localhost, as on a
@@ -580,14 +604,7 @@ func (p *Pool) spawn(ctx context.Context, s Spawn, now time.Time) {
 // runner asks the daemon for resolve to the same files.
 func (p *Pool) startJob(ctx context.Context, name string, runnerID int64, jitConfig string, s Spawn) ([]string, error) {
 	labels := func(role string) map[string]string {
-		return map[string]string{
-			labelPool:     p.cfg.Name,
-			labelRepo:     s.Repo,
-			labelRunnerID: strconv.FormatInt(runnerID, 10),
-			labelSlot:     strconv.Itoa(s.Slot),
-			labelRole:     role,
-			labelWork:     name + "-work",
-		}
+		return jobLabels(p.cfg, name, runnerID, s, role)
 	}
 	volumeLabels := func(kind string) map[string]string {
 		return map[string]string{

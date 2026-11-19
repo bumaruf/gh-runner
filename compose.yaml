@@ -24,6 +24,7 @@ services:
     env_file: .env
     environment:
       RUNNER_IMAGE: ghpool-runner:${RUNNER_VERSION:-2.338.2}
+      COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME}
     volumes:
       # ghpool drives Docker to start and remove the runner containers. The runners themselves
       # never get the socket.

@@ -109,6 +109,7 @@ Rode uma única instância por `POOL_NAME`. Hosts diferentes (um PC e uma VM, po
 | `RUNNER_MEMORY` | `0` | Limite de memória por job (`8g`, `512m`); `0` é sem limite. Com Docker nos jobs, vale também para o Docker do job. |
 | `RUNNER_DOCKER` | `false` | Dá a cada job um Docker próprio (`services:`, `container:`, `docker build`). |
 | `DIND_IMAGE` | `docker:29.9.2-dind` | Imagem do Docker de cada job. |
+| `COMPOSE_PROJECT` | | Projeto Compose em que os containers dos jobs aparecem agrupados nas interfaces do Docker. O `compose.yaml` já passa o nome do projeto. O Compose em si continua ignorando esses containers. |
 | `CACHE_TTL` | `336h` | Tempo sem runs depois do qual os caches de um repo são apagados. |
 | `POLL_INTERVAL` | `5s` | Intervalo entre consultas. |
 | `IDLE_TIMEOUT` | `5m` | Quanto um runner sem job espera antes de sair. |
