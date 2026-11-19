@@ -2,6 +2,9 @@ package pool
 
 import (
 	"fmt"
+	"os"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -93,11 +96,73 @@ func staleVolumes(in sweepInput) []string {
 }
 
 // cpuset pins slot n to its own run of CPUs, so `nproc` in a job reports what the job gets.
+// The run follows the core order: with SMT and an even share, a slot holds whole physical
+// cores, and neither another slot nor the host's own work shares them.
 // It returns "" when the slots do not fit on the host's CPUs; a CPU quota then applies.
-func cpuset(slot, slots, perSlot, hostCPUs int) string {
-	if perSlot < 1 || slots*perSlot > hostCPUs {
+func cpuset(slot, slots, perSlot int, cpus []int) string {
+	if perSlot < 1 || slots*perSlot > len(cpus) {
 		return ""
 	}
-	first := (slot - 1) * perSlot
-	return fmt.Sprintf("%d-%d", first, first+perSlot-1)
+	own := slices.Clone(cpus[(slot-1)*perSlot : slot*perSlot])
+	slices.Sort(own)
+	ids := make([]string, len(own))
+	for i, cpu := range own {
+		ids[i] = strconv.Itoa(cpu)
+	}
+	return strings.Join(ids, ",")
+}
+
+// coreOrder lists CPUs 0 to n-1 so that the threads of each physical core come one after
+// another. A CPU whose siblings are unknown counts as a core of its own.
+func coreOrder(n int, siblings func(cpu int) []int) []int {
+	placed := make([]bool, n)
+	order := make([]int, 0, n)
+	for cpu := range n {
+		if placed[cpu] {
+			continue
+		}
+		core := siblings(cpu)
+		if !slices.Contains(core, cpu) {
+			core = []int{cpu}
+		}
+		for _, c := range core {
+			if c >= 0 && c < n && !placed[c] {
+				placed[c] = true
+				order = append(order, c)
+			}
+		}
+	}
+	return order
+}
+
+// threadSiblings reads the CPUs that share a physical core with cpu. Containers see the
+// host's sysfs, so this works with ghpool itself in Docker.
+func threadSiblings(cpu int) []int {
+	data, err := os.ReadFile(fmt.Sprintf("/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cpu))
+	if err != nil {
+		return nil
+	}
+	return parseCPUList(strings.TrimSpace(string(data)))
+}
+
+// parseCPUList reads the kernel's CPU list format, such as "0,12" or "0-1,12-13".
+func parseCPUList(list string) []int {
+	var cpus []int
+	for _, part := range strings.Split(list, ",") {
+		from, to, isRange := strings.Cut(part, "-")
+		first, err := strconv.Atoi(from)
+		if err != nil {
+			return nil
+		}
+		last := first
+		if isRange {
+			if last, err = strconv.Atoi(to); err != nil || last < first {
+				return nil
+			}
+		}
+		for cpu := first; cpu <= last; cpu++ {
+			cpus = append(cpus, cpu)
+		}
+	}
+	return cpus
 }

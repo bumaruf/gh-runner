@@ -108,7 +108,8 @@ type Pool struct {
 	registerLabels []string
 	accepts        map[string]bool
 	ownName        *regexp.Regexp
-	hostCPUs       int
+	// hostCPUs lists the host's CPUs with the threads of each physical core together.
+	hostCPUs []int
 
 	repos     []string
 	reposAt   time.Time
@@ -168,9 +169,11 @@ func (p *Pool) Run(ctx context.Context) error {
 			return err
 		}
 	}
-	if p.hostCPUs, err = p.docker.CPUs(ctx); err != nil {
+	cpus, err := p.docker.CPUs(ctx)
+	if err != nil {
 		return fmt.Errorf("read host CPUs: %w", err)
 	}
+	p.hostCPUs = coreOrder(cpus, threadSiblings)
 	for slot := 1; slot <= p.cfg.Slots; slot++ {
 		if err := p.docker.EnsureNetwork(ctx, p.network(slot), map[string]string{labelPool: p.cfg.Name}); err != nil {
 			return fmt.Errorf("create network of slot %d: %w", slot, err)
