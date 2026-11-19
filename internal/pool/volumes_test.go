@@ -66,14 +66,36 @@ func TestStaleVolumesAreThoseNothingWillUseAgain(t *testing.T) {
 }
 
 func TestEachSlotGetsItsOwnCPUsWhenTheyFit(t *testing.T) {
-	if got := cpuset(1, 6, 4, 24); got != "0-3" {
+	noSMT := coreOrder(24, func(int) []int { return nil })
+	if got := cpuset(1, 6, 4, noSMT); got != "0,1,2,3" {
 		t.Fatalf("slot 1 = %q", got)
 	}
-	if got := cpuset(6, 6, 4, 24); got != "20-23" {
+	if got := cpuset(6, 6, 4, noSMT); got != "20,21,22,23" {
 		t.Fatalf("slot 6 = %q", got)
 	}
-	if got := cpuset(1, 6, 5, 24); got != "" {
+	if got := cpuset(1, 6, 5, noSMT); got != "" {
 		t.Fatalf("6 slots of 5 CPUs do not fit on 24, got %q", got)
+	}
+}
+
+// With SMT, Linux numbers a core's two threads apart (0 and 12 on a 12-core host). A slot that
+// took 0 and 1 would leave 12 and 13 to the host, and both would fight over the same cores.
+func TestWithSMTASlotOfTwoHoldsOneWholeCore(t *testing.T) {
+	smt := coreOrder(24, func(cpu int) []int { return []int{cpu % 12, cpu%12 + 12} })
+
+	if got := cpuset(1, 6, 2, smt); got != "0,12" {
+		t.Fatalf("slot 1 = %q, want core 0", got)
+	}
+	if got := cpuset(6, 6, 2, smt); got != "5,17" {
+		t.Fatalf("slot 6 = %q, want core 5", got)
+	}
+}
+
+func TestTheKernelsCPUListsAreRead(t *testing.T) {
+	for list, want := range map[string][]int{"0,12": {0, 12}, "0-1": {0, 1}, "2-3,14-15": {2, 3, 14, 15}, "x": nil} {
+		if got := parseCPUList(list); !slices.Equal(got, want) {
+			t.Errorf("parseCPUList(%q) = %v, want %v", list, got, want)
+		}
 	}
 }
 
